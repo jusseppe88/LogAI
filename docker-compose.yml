@@ -1,5 +1,3 @@
-#version: '3.8'
-
 services:
   # 1. Your Custom Python API (Log Fetcher)
   logai-api:
