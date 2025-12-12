@@ -10,11 +10,20 @@ services:
       - "8765:8765"
       - "2526:2526" # SMTP Proxy Port
     environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/London
       - MAILCOW_IP=192.168.1.100 # REPLACE THIS WITH YOUR MAIL SERVER IP
       - MAILCOW_PORT=465         # REPLACE THIS WITH YOUR MAIL SERVER PORT
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock # Needs access to Docker
       - /var/log:/host_logs:ro                    # Needs access to System Logs
+      - /etc/machine-id:/etc/machine-id:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s  
 
   # 2. n8n (The Workflow Orchestrator)
   n8n:
