@@ -86,6 +86,13 @@ class LogFetcher:
             r'.*prowlarr.*api/v1/indexer', r'.*IP geolocation database loaded.*', r'.*Successfully parsed.*',
             r'query\[A\]', r'query\[AAAA\]', r'.*INF.*Connection.*registered.*', r'.*INF.*Quic.*connection.*',
             r'.*INF.*Generated.*event.*', r'.*IP address.*matches.*', r'.*Checking.*IP.*',
+            r'.*healthMonitoring.*succeeded but took.*',
+            r'.*No active video sessions found.*',
+            r'.*tRPC request from.*',
+            r'.*healthMonitoring.*succeeded but took.*',
+            r'.*No active video sessions found.*',
+            r'.*tRPC request from.*',
+            r'.*Failed to get releases.*',
             # Mailcow specific
             r'.*connect from unknown.*', r'.*lost connection.*', r'.*disconnect from unknown.*',
             r'.*statistics:.*', r'.*NOQUEUE: reject:.*', r'.*pop3-login: Disconnected.*',
