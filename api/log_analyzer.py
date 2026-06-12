@@ -27,6 +27,11 @@ DOCKER_LOG_TAIL_LINES = int(os.getenv("DOCKER_LOG_TAIL_LINES", "8000"))
 # Safety: if processing takes too long, bail out
 MAX_PROCESS_SECONDS = int(os.getenv("MAX_PROCESS_SECONDS", "120"))
 
+# Safety: cap line length before regex filtering — \r-progress blobs
+# (yt-dlp etc.) can otherwise form multi-MB "lines" that grind the
+# noise regex for hours and wedge the worker (metube incident 2026-06-12)
+MAX_LINE_CHARS = int(os.getenv("MAX_LINE_CHARS", "2000"))
+
 
 # ==========================================
 # MODELS
@@ -90,6 +95,7 @@ class LogFetcher:
             r".*No active video sessions found.*",
             r".*tRPC request from.*",
             r".*Failed to get releases.*",
+            r"\[download\]\s+\d{1,3}(?:\.\d+)?%",
         ]
         self._noise_re = re.compile("|".join(f"(?:{p})" for p in noise_patterns), re.IGNORECASE)
 
@@ -171,7 +177,9 @@ class LogFetcher:
                 )
 
                 logs = logs_bytes.decode("utf-8", errors="ignore")
-                raw_lines = logs.split("\n")
+                # \r-overwritten progress output (yt-dlp etc.) would otherwise
+                # keep an entire progress session as ONE multi-MB line
+                raw_lines = logs.replace("\r", "\n").split("\n")
 
                 stats_info = self.get_stats(name)
 
@@ -180,6 +188,12 @@ class LogFetcher:
                 if time.time() - start_time > MAX_PROCESS_SECONDS:
                     stats_info = f"{stats_info} | NOTE: processing timed out after {MAX_PROCESS_SECONDS}s"
                     break
+
+                # Never feed the noise regex an unbounded line — a single huge
+                # line can grind the regex engine far past MAX_PROCESS_SECONDS
+                # (the guard above only fires between lines)
+                if len(line) > MAX_LINE_CHARS:
+                    line = line[:MAX_LINE_CHARS] + " ...[line truncated]"
 
                 if self.filter_noise(line):
                     s = line.strip()
