@@ -273,3 +273,262 @@ async def fetch_single(request: LogRequest):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+# ==========================================
+# DIGEST (added 2026-09-27): whole-window, templated, severity-first
+# ==========================================
+# /fetch_single returns the LAST 1000 filtered lines, so on chatty containers the
+# analyser only ever saw the final hours of the 24 h window. /digest reads the full
+# window (streamed, bounded by lines, bytes and time), collapses repeated lines into
+# templates with counts and first/last timestamps, and spends a fixed character budget
+# on WARN/ERROR templates first. `meta.complete` is False whenever anything was cut, so
+# the caller never treats a partial digest as proof that an issue went away.
+from concurrent.futures import ThreadPoolExecutor
+
+DIGEST_TAIL_LINES = int(os.getenv("DIGEST_TAIL_LINES", "60000"))
+DIGEST_MAX_BYTES = int(os.getenv("DIGEST_MAX_BYTES", str(48 * 1024 * 1024)))
+DIGEST_BUDGET_CHARS = int(os.getenv("DIGEST_BUDGET_CHARS", "5000"))
+DIGEST_SAMPLE_CHARS = int(os.getenv("DIGEST_SAMPLE_CHARS", "260"))
+DIGEST_WORKERS = int(os.getenv("DIGEST_WORKERS", "3"))
+
+_DOCKER_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z?\s")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|(?<![\w\]])\[[0-9;]{1,8}m")
+_VOLATILE = [
+    (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<ts>"),
+    (re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4},? \d{1,2}:\d{2}(?::\d{2})?(?: ?[AP]M)?", re.I), "<ts>"),
+    (re.compile(r"\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b"), "<ts>"),
+    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I), "<uuid>"),
+    (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"), "<ip>"),
+    (re.compile(r"\b(?:0x)?[0-9a-f]{8,}\b", re.I), "<hex>"),
+    (re.compile(r"\d+(?:\.\d+)?"), "#"),
+    (re.compile(r"\s+"), " "),
+]
+_SEV = [
+    (3, re.compile(r"\b(fatal|panic|critical|crit|traceback|segfault|oom|out of memory|killed)\b", re.I)),
+    (2, re.compile(r"\b(error|err|exception|fail(?:ed|ure|s)?|refused|denied|unauthori[sz]ed|forbidden|"
+                   r"timed? ?out|timeout|unreachable|unavailable|crash(?:ed)?|exited|abort(?:ed)?)\b", re.I)),
+    (1, re.compile(r"\b(warn|warning|deprecat\w*)\b", re.I)),
+]
+_SEV_NAME = {3: "CRIT", 2: "ERR", 1: "WARN", 0: "INFO"}
+# "error=nil", "0 errors", "errors: 0" and similar are not errors
+_NOT_ERR = re.compile(r"\b(error=(nil|null|none|\"\")|0 errors?|errors?: ?0\b|no errors?|without errors?)", re.I)
+_EXPLICIT = re.compile(r"(?:\b(?:lvl|level|severity|loglevel)[=:]\s*[\"']?([a-z]+)|\[(trace|debug|dbg|info|inf|notice|warn|warning|wrn|error|err|eror|fatal|ftl|crit|critical)\]|(?:^|\s|\|)(TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|FATAL|CRITICAL)(?:\s|:|\|))", re.I)
+_EXPLICIT_MAP = {"trace": 0, "debug": 0, "dbg": 0, "info": 0, "inf": 0, "notice": 0, "warn": 1, "warning": 1,
+                 "wrn": 1, "error": 2, "err": 2, "eror": 2, "fatal": 3, "ftl": 3, "crit": 3, "critical": 3}
+# an explicit-INFO line is bumped to WARN only on clear failure phrases
+# (media titles like "Crash" or "The Fatal Five" must not trip it)
+_INFO_BUMP = re.compile(r"\b(failed|failure|error|exception|timed out|timeout|refused|denied|unable to|could not|cannot|panic|traceback)\b", re.I)
+
+
+def _severity(body: str) -> int:
+    m = _EXPLICIT.search(body[:200])
+    if m:
+        lv = _EXPLICIT_MAP.get((m.group(1) or m.group(2) or m.group(3) or "").lower())
+        if lv is not None:
+            if lv == 0:
+                return 1 if (_INFO_BUMP.search(body) and not _NOT_ERR.search(body)) else 0
+            return lv
+    for level, rx in _SEV:
+        if rx.search(body):
+            if level == 2 and _NOT_ERR.search(body) and not _SEV[0][1].search(body):
+                return 0
+            return level
+    return 0
+
+
+_INNER_TS = re.compile(r"(?:\bts=|\btime=)?[\"']?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?[\"']?\s?")
+
+
+def _template(body: str) -> str:
+    t = body.lower()
+    for rx, rep in _VOLATILE:
+        t = rx.sub(rep, t)
+    return t.strip()
+
+
+def build_digest(lines, budget=DIGEST_BUDGET_CHARS, sample_chars=DIGEST_SAMPLE_CHARS, noise=None, deadline=None):
+    """lines: iterable of raw log lines (docker lines may carry an RFC3339 prefix)."""
+    tmpl = {}
+    raw = kept = 0
+    first_ts = last_ts = ""
+    timed_out = False
+    for line in lines:
+        raw += 1
+        if deadline is not None and (raw & 1023) == 0 and time.time() > deadline:
+            timed_out = True
+            break
+        if len(line) > MAX_LINE_CHARS:
+            line = line[:MAX_LINE_CHARS] + " ...[line truncated]"
+        s = _ANSI.sub("", line).strip()
+        if not s:
+            continue
+        ts = ""
+        m = _DOCKER_TS.match(s)
+        if m:
+            ts = m.group(1)
+            s = s[m.end():].strip()
+            if not s:
+                continue
+        sev = _severity(s)
+        # key = FULL normalised content + severity: two lines never share a template just
+        # because they share a long prefix, and an ERROR never inherits an INFO's level
+        key = (sev, _template(s))
+        e = tmpl.get(key)
+        if e is None:
+            # the noise regex is expensive (~10 ms/line on long lines), so it runs once per
+            # TEMPLATE, not once per line; a noisy template is remembered and skipped
+            tmpl[key] = e = {"n": 0, "first": ts, "last": ts, "raw": _INNER_TS.sub("", s).strip(),
+                             "sev": sev, "order": kept + 1,
+                             "noise": bool(noise is not None and not noise(s))}
+        if e["noise"]:
+            continue
+        kept += 1
+        if ts:
+            first_ts = first_ts or ts
+            last_ts = ts
+            e["first"] = e["first"] or ts
+            e["last"] = ts
+        e["n"] += 1
+        e["recent"] = kept
+
+    def fmt(e, chars):
+        span = ""
+        if e["first"]:
+            a, b = e["first"][5:16].replace("T", " "), e["last"][5:16].replace("T", " ")
+            span = f" {a}" if e["n"] == 1 or a == b else f" {a}..{b}"
+        cnt = f" x{e['n']}" if e["n"] > 1 else ""
+        r = e["raw"]
+        if len(r) > chars:   # keep head AND tail: the distinguishing part is often at the end
+            head = int(chars * 0.6)
+            r = r[:head] + " ... " + r[-(chars - head - 5):]
+        return f"[{_SEV_NAME[e['sev']]}{cnt}{span}] {r}"
+
+    live = [e for e in tmpl.values() if not e["noise"] and e["n"] > 0]
+    signal = sorted((e for e in live if e["sev"] > 0), key=lambda e: (-e["sev"], -e["n"], e["order"]))
+    info = [e for e in live if e["sev"] == 0]
+    rare_info = sorted((e for e in info if e["n"] <= 3), key=lambda e: -e["recent"])
+    freq_info = sorted((e for e in info if e["n"] > 3), key=lambda e: -e["n"])
+
+    header_room = 260  # the header line is part of the budget
+    sig_budget = budget - header_room
+    # Signal first. If it does not fit at full sample length, shorten the samples
+    # (260 -> 160 -> 100 chars) before dropping anything; INFO then gets what is left.
+    chars = sample_chars
+    for c in (sample_chars, 160, 100):
+        chars = c
+        if sum(len(fmt(e, c)) + 1 for e in signal) <= sig_budget:
+            break
+    out, used, dropped_signal = [], 0, 0
+    for e in signal:
+        line = fmt(e, chars)
+        if used + len(line) + 1 > sig_budget:
+            dropped_signal += 1
+            continue
+        out.append(line)
+        used += len(line) + 1
+    info_cap = min(sig_budget, used + int(budget * 0.5))
+    for e in freq_info[:5]:               # the chattiest INFO templates, as counts
+        line = fmt(e, sample_chars)
+        if used + len(line) + 1 <= info_cap:
+            out.append(line)
+            used += len(line) + 1
+    for e in rare_info:                   # rare INFO lines (starts, config, state changes), newest first
+        line = fmt(e, sample_chars)
+        if used + len(line) + 1 > info_cap:
+            break
+        out.append(line)
+        used += len(line) + 1
+
+    header = (f"window {first_ts or '?'} .. {last_ts or '?'} | raw_lines {raw} | kept {kept} | "
+              f"templates {len(live)} (signal {len(signal)}) | shown {len(out)}"
+              + (f" | SIGNAL_TRUNCATED {dropped_signal}" if dropped_signal else "")
+              + (" | PROCESSING_TIMED_OUT" if timed_out else ""))[:header_room - 1]
+    meta = {"raw_lines": raw, "kept_lines": kept, "templates": len(live), "signal_templates": len(signal),
+            "signal_dropped": dropped_signal, "shown": len(out), "window_first": first_ts, "window_last": last_ts,
+            "timed_out": timed_out}
+    return (header + "\n" + "\n".join(out)) if out else "", meta
+
+
+def _iter_container_lines(container, since, deadline, info):
+    """Stream docker logs line by line, bounded by lines, bytes and time (no full materialisation).
+    follow=False is essential: docker-py defaults follow to the value of stream and would block forever."""
+    stream = container.logs(since=since, timestamps=True, tail=DIGEST_TAIL_LINES, stdout=True, stderr=True, stream=True, follow=False)
+    buf, total, lines = b"", 0, 0
+    try:
+        for chunk in stream:
+            total += len(chunk)
+            if total > DIGEST_MAX_BYTES:
+                info["byte_capped"] = True
+                break
+            if time.time() > deadline:
+                info["fetch_timed_out"] = True
+                break
+            buf += chunk
+            while True:
+                i = buf.find(b"\n")
+                if i < 0:
+                    break
+                ln, buf = buf[:i], buf[i + 1:]
+                for part in ln.decode("utf-8", errors="ignore").split("\r"):
+                    lines += 1
+                    yield part[:MAX_LINE_CHARS + 20]
+            if len(buf) > MAX_LINE_CHARS * 4:           # a runaway line with no newline yet
+                lines += 1
+                yield buf[:MAX_LINE_CHARS].decode("utf-8", errors="ignore")
+                buf = b""
+        if buf:
+            lines += 1
+            yield buf[:MAX_LINE_CHARS].decode("utf-8", errors="ignore")
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+        info["tail_capped"] = lines >= DIGEST_TAIL_LINES
+
+
+def digest_one(name: str, hours: int, budget: int) -> Dict:
+    t0 = time.time()
+    deadline = t0 + MAX_PROCESS_SECONDS
+    try:
+        info = {}
+        if name.startswith("/"):
+            if not os.path.exists(name):
+                return {"name": name, "status": "error", "digest": "", "error": "File not found"}
+            lines = fetcher._tail_file_lines(name, MAX_LINES_PER_SOURCE * 5)
+        else:
+            if not fetcher.client:
+                return {"name": name, "status": "error", "digest": "", "error": "Docker Client Missing"}
+            container = fetcher.client.containers.get(name)
+            st = container.attrs.get("State", {}) or {}
+            info = {"started_at": st.get("StartedAt", ""), "restart_count": container.attrs.get("RestartCount", 0),
+                    "health": (st.get("Health") or {}).get("Status", "")}
+            lines = _iter_container_lines(container, datetime.now() - timedelta(hours=hours), deadline, info)
+        digest, meta = build_digest(lines, budget=budget, noise=fetcher.filter_noise, deadline=deadline)
+        meta.update(info)
+        meta["complete"] = not (meta.get("timed_out") or meta.get("signal_dropped") or info.get("tail_capped")
+                                or info.get("byte_capped") or info.get("fetch_timed_out"))
+        meta["seconds"] = round(time.time() - t0, 2)
+        return {"name": name, "status": "success" if digest else "empty", "digest": digest, "meta": meta}
+    except Exception as e:
+        return {"name": name, "status": "error", "digest": "", "error": str(e)[:300]}
+
+
+class DigestRequest(BaseModel):
+    containers: List[str]
+    hours: int = 24
+    budget_chars: int = DIGEST_BUDGET_CHARS
+
+
+def _digest_many(names, hours, budget):
+    with ThreadPoolExecutor(max_workers=max(1, DIGEST_WORKERS)) as ex:
+        return list(ex.map(lambda n: digest_one(n, hours, budget), names))
+
+
+@app.post("/digest")
+async def digest(request: DigestRequest):
+    names = [n for n in (request.containers or []) if n][:20]
+    budget = max(1000, min(int(request.budget_chars or DIGEST_BUDGET_CHARS), 20000))
+    results = await asyncio.to_thread(_digest_many, names, int(request.hours or 24), budget)
+    return {"results": results}
