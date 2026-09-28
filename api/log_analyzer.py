@@ -33,6 +33,42 @@ MAX_PROCESS_SECONDS = int(os.getenv("MAX_PROCESS_SECONDS", "120"))
 MAX_LINE_CHARS = int(os.getenv("MAX_LINE_CHARS", "2000"))
 
 
+
+# ==========================================
+# SECRET REDACTION
+# ==========================================
+# Private keys must never leave this API (LLM prompts, n8n executions, mail).
+# Handles single-line PEM (escaped \n) and multi-line PEM, including
+# util.inspect-style dumps where each body line is its own log line.
+_PEM_INLINE = re.compile(r"-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY-----.*?(?:-----END \1PRIVATE KEY-----|$)")
+_PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+_PEM_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
+_TS_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}T[0-9:.]+Z\s")
+PEM_MAX_BODY_LINES = 120
+
+
+def redact_lines(lines):
+    """Yield lines with private-key material replaced by [REDACTED PRIVATE KEY]."""
+    in_key, body = False, 0
+    for line in lines:
+        if in_key:
+            m = _TS_PREFIX.match(line)
+            prefix = m.group(0) if m else ""
+            body += 1
+            if _PEM_END.search(line) or body > PEM_MAX_BODY_LINES:
+                in_key = False
+            yield prefix + "[REDACTED PRIVATE KEY]"
+            continue
+        if _PEM_BEGIN.search(line):
+            red = _PEM_INLINE.sub("[REDACTED PRIVATE KEY]", line)
+            last_begin = list(_PEM_BEGIN.finditer(line))[-1].end()
+            if not _PEM_END.search(line, last_begin):
+                in_key, body = True, 0
+            yield red
+            continue
+        yield line
+
+
 # ==========================================
 # MODELS
 # ==========================================
@@ -184,7 +220,7 @@ class LogFetcher:
                 stats_info = self.get_stats(name)
 
             relevant_logs: List[str] = []
-            for line in raw_lines:
+            for line in redact_lines(raw_lines):
                 if time.time() - start_time > MAX_PROCESS_SECONDS:
                     stats_info = f"{stats_info} | NOTE: processing timed out after {MAX_PROCESS_SECONDS}s"
                     break
@@ -505,7 +541,7 @@ def digest_one(name: str, hours: int, budget: int) -> Dict:
             info = {"started_at": st.get("StartedAt", ""), "restart_count": container.attrs.get("RestartCount", 0),
                     "health": (st.get("Health") or {}).get("Status", "")}
             lines = _iter_container_lines(container, datetime.now() - timedelta(hours=hours), deadline, info)
-        digest, meta = build_digest(lines, budget=budget, noise=fetcher.filter_noise, deadline=deadline)
+        digest, meta = build_digest(redact_lines(lines), budget=budget, noise=fetcher.filter_noise, deadline=deadline)
         meta.update(info)
         meta["complete"] = not (meta.get("timed_out") or meta.get("signal_dropped") or info.get("tail_capped")
                                 or info.get("byte_capped") or info.get("fetch_timed_out"))
