@@ -32,6 +32,59 @@ MAX_PROCESS_SECONDS = int(os.getenv("MAX_PROCESS_SECONDS", "120"))
 # noise regex for hours and wedge the worker (metube incident 2026-06-12)
 MAX_LINE_CHARS = int(os.getenv("MAX_LINE_CHARS", "2000"))
 
+# Per-container known-benign lines, dropped from /digest before any model sees them.
+# Each pattern must match the WHOLE line (after timestamp/ANSI stripping), so a
+# crash, bind error or any other text on the line still reaches the analyser.
+# vibravid: the upstream entrypoint runs Django runserver on purpose (owner-accepted,
+# LAN-only app); its fixed startup banner was re-escalated under new paraphrases.
+CONTAINER_NOISE_LINES = {
+    "vibravid": [
+        r"Starting development server at http://0\.0\.0\.0:8000/",
+        r"WARNING: This is a development server\. Do not use it in a production setting\. "
+        r"Use a production WSGI or ASGI server instead\.",
+        r"For more information on production servers see: "
+        r"https://docs\.djangoproject\.com/en/\d{1,2}\.\d{1,2}/howto/deployment/",
+    ],
+}
+_CONTAINER_NOISE_RE = {
+    name: re.compile("|".join(f"(?:{p})" for p in pats))
+    for name, pats in CONTAINER_NOISE_LINES.items()
+}
+
+
+def drop_container_noise(name: str, lines, info: dict, deadline=None):
+    """Yield lines except the container's known-benign whole lines.
+
+    Runs per line, before build_digest's per-template noise cache, so a template
+    collision can never carry a drop decision over to a different line. Matches the
+    whole (already source-bounded) line, never a truncated prefix. Checks the deadline
+    itself, because dropped lines never reach build_digest's periodic check.
+    """
+    rx = _CONTAINER_NOISE_RE.get(name)
+    if rx is None:
+        yield from lines
+        return
+    info["container_noise_dropped"] = 0
+    n = 0
+    for line in lines:
+        n += 1
+        if deadline is not None and (n & 1023) == 0 and time.time() > deadline:
+            info["noise_timed_out"] = True
+            return
+        # A line at or over the cap may be a truncated prefix (the iterator cuts EOF and
+        # runaway lines to MAX_LINE_CHARS without a marker): never treat it as a whole line.
+        if len(line) >= MAX_LINE_CHARS:
+            yield line
+            continue
+        s = _ANSI.sub("", line).strip()
+        m = _DOCKER_TS.match(s)
+        if m:
+            s = s[m.end():].strip()
+        if rx.fullmatch(s):
+            info["container_noise_dropped"] += 1
+            continue
+        yield line
+
 
 
 # ==========================================
@@ -45,10 +98,22 @@ _PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _PEM_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
 _TS_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}T[0-9:.]+Z\s")
 PEM_MAX_BODY_LINES = 120
+# Secret values in env dumps (Dockhand env rebase), query strings, JSON keys and bearer headers.
+# Env names match upper-case only, so prose such as "bearer token: timeout" stays readable.
+_SECRET_ENV = re.compile(r'\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|APIKEY|API_KEY|_KEY|AUTH)[A-Z0-9_]*\s*=\s*)([^"\\\s,;&\]\}]+)')
+_SECRET_QUERY = re.compile(r'(?i)([?&](?:api_?key|apikey|token|access_token|secret|password|pass|passwd)=)[^&\s"\'#]+')
+_SECRET_JSON = re.compile(r'(?i)(\\?"[a-z0-9_]*(?:token|secret|password|passwd|api_?key)\\?"\s*:\s*\\?")[^"\\]+')
+_BEARER = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+
+
+def _redact_secrets(line):
+    for rx in (_SECRET_ENV, _SECRET_QUERY, _SECRET_JSON, _BEARER):
+        line = rx.sub(lambda m: m.group(1) + "[REDACTED]", line)
+    return line
 
 
 def redact_lines(lines):
-    """Yield lines with private-key material replaced by [REDACTED PRIVATE KEY]."""
+    """Yield lines with private keys and secret values redacted."""
     in_key, body = False, 0
     for line in lines:
         if in_key:
@@ -64,9 +129,9 @@ def redact_lines(lines):
             last_begin = list(_PEM_BEGIN.finditer(line))[-1].end()
             if not _PEM_END.search(line, last_begin):
                 in_key, body = True, 0
-            yield red
+            yield _redact_secrets(red)
             continue
-        yield line
+        yield _redact_secrets(line)
 
 
 # ==========================================
@@ -541,10 +606,12 @@ def digest_one(name: str, hours: int, budget: int) -> Dict:
             info = {"started_at": st.get("StartedAt", ""), "restart_count": container.attrs.get("RestartCount", 0),
                     "health": (st.get("Health") or {}).get("Status", "")}
             lines = _iter_container_lines(container, datetime.now() - timedelta(hours=hours), deadline, info)
+        lines = drop_container_noise(name, lines, info, deadline)
         digest, meta = build_digest(redact_lines(lines), budget=budget, noise=fetcher.filter_noise, deadline=deadline)
         meta.update(info)
         meta["complete"] = not (meta.get("timed_out") or meta.get("signal_dropped") or info.get("tail_capped")
-                                or info.get("byte_capped") or info.get("fetch_timed_out"))
+                                or info.get("byte_capped") or info.get("fetch_timed_out")
+                                or info.get("noise_timed_out"))
         meta["seconds"] = round(time.time() - t0, 2)
         return {"name": name, "status": "success" if digest else "empty", "digest": digest, "meta": meta}
     except Exception as e:
